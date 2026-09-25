@@ -8,6 +8,14 @@ It was written for a desktop with an external monitor controlled over DDC/CI, bu
 it works with anything Plasma can set the brightness of, laptop backlights
 included.
 
+## Authorship
+
+The code and docs were written by Claude (Anthropic's AI) in a
+[Claude Code](https://claude.com/claude-code) session. Anatoly Bubenkov set the
+direction and made the design decisions. It runs daily on his desktop (Logitech
+C920 and Dell U2711), but it was not written by hand. Please review it with that
+in mind, and report anything that looks off.
+
 ## Why
 
 - Plasma (6.6+) has built-in automatic brightness. It needs a hardware light
