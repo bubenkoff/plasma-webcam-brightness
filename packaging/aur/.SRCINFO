@@ -1,6 +1,6 @@
 pkgbase = plasma-webcam-brightness
 	pkgdesc = Automatic screen brightness for KDE Plasma using a webcam as the light sensor (works with DDC/CI monitors)
-	pkgver = 0.1.0
+	pkgver = 0.1.1
 	pkgrel = 1
 	url = https://github.com/bubenkoff/plasma-webcam-brightness
 	arch = any
@@ -10,7 +10,7 @@ pkgbase = plasma-webcam-brightness
 	depends = v4l-utils
 	depends = ffmpeg
 	depends = powerdevil
-	source = plasma-webcam-brightness-0.1.0.tar.gz::https://github.com/bubenkoff/plasma-webcam-brightness/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = 4c2c88697e99f862cc9a7692624c4ec11cf406abaef68b8bdb4afa40dade3c9e
+	source = plasma-webcam-brightness-0.1.1.tar.gz::https://github.com/bubenkoff/plasma-webcam-brightness/archive/refs/tags/v0.1.1.tar.gz
+	sha256sums = 0da0d3e707ddf141ae6eb70d693b63cc2fee758562fb7df3b9763ccfc003d7c1
 
 pkgname = plasma-webcam-brightness
