@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Automatic screen brightness for KDE Plasma, using a webcam as the light sensor.
+
+Every few minutes a single frame is grabbed at a fixed exposure and turned into
+an ambient light level. Brightness is set through Plasma's own
+org.kde.ScreenBrightness D-Bus API, so KWin/PowerDevil stay the only thing that
+talks to the monitor (DDC/CI or backlight), and keys, OSD and tray slider keep
+working as usual.
+
+Manual changes (brightness keys, tray slider, System Settings) are learned: the
+curve is bent to pass through what you picked at the current light level, and
+automatic changes pause until the ambient light moves noticeably.
+"""
+
+import argparse
+import json
+import logging
+import math
+import os
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+from gi.repository import Gio, GLib
+
+APP = "plasma-webcam-brightness"
+CONTEXT = APP  # tags our own brightness changes so we can tell them from the user's
+
+BRIGHTNESS_SERVICE = "org.kde.ScreenBrightness"
+BRIGHTNESS_PATH = "/org/kde/ScreenBrightness"
+BRIGHTNESS_IFACE = "org.kde.ScreenBrightness"
+DISPLAY_IFACE = "org.kde.ScreenBrightness.Display"
+SUPPRESS_INDICATOR = 0x1
+
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / f"{APP}.toml"
+STATE_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / APP / "state.json"
+
+DEFAULTS = {
+    "device": "/dev/video0",
+    "interval": 300,  # seconds between measurements
+    "min_step": 0.04,  # smallest brightness change worth making (fraction)
+    "deadzone_ev": 0.6,  # after a manual change, ignore ambient drift smaller than this
+    "displays": [],  # display labels to control; empty means all
+}
+
+# Curve: brightness (0..1) at anchor points spaced 1 EV apart. The ambient level is
+# log2(mean frame luma / exposure time), i.e. relative, camera-specific units.
+EV_MIN, EV_MAX = -10, 4
+ANCHORS = list(range(EV_MIN, EV_MAX + 1))
+
+log = logging.getLogger(APP)
+
+
+def default_curve():
+    return [min(1.0, max(0.1, 0.95 + 0.12 * ev)) for ev in ANCHORS]
+
+
+def sample(curve, ev):
+    ev = min(max(ev, EV_MIN), EV_MAX)
+    i = min(int(math.floor(ev)) - EV_MIN, len(ANCHORS) - 2)
+    t = ev - ANCHORS[i]
+    return curve[i] + (curve[i + 1] - curve[i]) * t
+
+
+def adjust(curve, ev, brightness):
+    """Bend the curve so it passes through (ev, brightness) and stays non-decreasing."""
+    ev = min(max(ev, EV_MIN), EV_MAX)
+    curve = list(curve)
+    for _ in range(30):
+        delta = brightness - sample(curve, ev)
+        if abs(delta) < 0.002:
+            break
+        for i, anchor in enumerate(ANCHORS):
+            weight = max(0.0, 1 - abs(anchor - ev) / 2)  # triangular kernel, +/-2 EV
+            curve[i] = min(1.0, max(0.0, curve[i] + delta * weight))
+    for i, anchor in enumerate(ANCHORS):
+        if anchor < ev:
+            curve[i] = min(curve[i], brightness)
+        elif anchor > ev:
+            curve[i] = max(curve[i], brightness)
+    for i in range(1, len(curve)):
+        curve[i] = max(curve[i], curve[i - 1])
+    return curve
+
+
+class Camera:
+    # kernel control names changed over time; first match wins
+    NAMES = {
+        "auto_exposure": ("auto_exposure", "exposure_auto"),
+        "exposure": ("exposure_time_absolute", "exposure_absolute"),
+        "dynamic_framerate": ("exposure_dynamic_framerate", "exposure_auto_priority"),
+        "auto_wb": ("white_balance_automatic", "white_balance_temperature_auto"),
+        "gain": ("gain",),
+    }
+    MANUAL = {"auto_exposure": 1, "dynamic_framerate": 0, "auto_wb": 0, "gain": 0}
+
+    def __init__(self, device):
+        self.device = device
+        self.exposure = None
+        self.controls = {}
+        self.exp_min, self.exp_max = 3, 2047
+
+    def _ctl(self, *args):
+        return subprocess.run(["v4l2-ctl", "-d", self.device, *args], capture_output=True, text=True, timeout=10)
+
+    def _discover(self):
+        out = self._ctl("-l").stdout
+        available = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) > 1:
+                available[parts[0]] = line
+        self.controls = {}
+        for key, names in self.NAMES.items():
+            for name in names:
+                if name in available:
+                    self.controls[key] = name
+                    if key == "exposure":
+                        fields = dict(f.split("=", 1) for f in available[name].split() if "=" in f)
+                        self.exp_min = int(fields.get("min", self.exp_min))
+                        self.exp_max = int(fields.get("max", self.exp_max))
+                    break
+        if "auto_exposure" not in self.controls or "exposure" not in self.controls:
+            raise RuntimeError(f"{self.device} has no manual exposure control")
+        if self.exposure is None:
+            self.exposure = min(max(150, self.exp_min), self.exp_max)
+
+    def _get(self):
+        names = ",".join(self.controls.values())
+        out = self._ctl("-C", names).stdout
+        values = dict(line.split(":", 1) for line in out.splitlines() if ":" in line)
+        return {k: v.strip() for k, v in values.items()}
+
+    def _set(self, values):
+        if values:
+            self._ctl(*[arg for name, value in values.items() for arg in ("-c", f"{name}={value}")])
+
+    def busy(self):
+        real = os.path.realpath(self.device)
+        for fd_dir in Path("/proc").glob("[0-9]*/fd"):
+            try:
+                for fd in fd_dir.iterdir():
+                    if os.path.realpath(fd) == real:
+                        return True
+            except OSError:
+                continue
+        return False
+
+    def _grab(self):
+        for size in (["-video_size", "160x120"], []):
+            proc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "v4l2", *size, "-i", self.device,
+                 "-vf", r"select=gte(n\,5),scale=1:1:flags=area,format=gray",
+                 "-frames:v", "1", "-f", "rawvideo", "-"],
+                capture_output=True, timeout=20)
+            if proc.returncode == 0 and len(proc.stdout) == 1:
+                return proc.stdout[0]
+        log.warning("frame capture failed: %s", proc.stderr.decode(errors="replace").strip())
+        return None
+
+    def measure(self):
+        """Return the ambient level in EV, or None if the camera is unavailable."""
+        if not os.path.exists(self.device):
+            log.warning("%s does not exist", self.device)
+            return None
+        if self.busy():
+            log.info("camera in use by another program, skipping measurement")
+            return None
+        self._discover()
+        saved = self._get()
+        manual = {self.controls[k]: v for k, v in self.MANUAL.items() if k in self.controls}
+        try:
+            self._set(manual)
+            luma = None
+            for _ in range(5):
+                self._set({self.controls["exposure"]: self.exposure})
+                luma = self._grab()
+                if luma is None:
+                    return None
+                if luma > 200 and self.exposure > self.exp_min:
+                    self.exposure = max(self.exp_min, self.exposure // 4)
+                elif luma < 15 and self.exposure < self.exp_max:
+                    self.exposure = min(self.exp_max, self.exposure * 4)
+                else:
+                    break
+            ev = math.log2(max(luma, 0.5) / self.exposure)
+            log.debug("luma %d at exposure %d -> %.2f EV", luma, self.exposure, ev)
+            return ev
+        finally:
+            # auto modes first, otherwise the kernel refuses to restore some values
+            self._set({name: saved[name] for name in manual if name in saved})
+
+
+class Daemon:
+    def __init__(self, config):
+        self.config = config
+        self.camera = Camera(config["device"])
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        self.state = self._load_state()
+        self.hold = {}  # label -> EV at which the user last set brightness
+        self.last_ev = None
+        self.learn_timer = None
+
+    def _load_state(self):
+        try:
+            return json.loads(STATE_PATH.read_text())
+        except (OSError, ValueError):
+            return {"curves": {}}
+
+    def _save_state(self):
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.state, indent=1))
+        tmp.replace(STATE_PATH)
+
+    def _call(self, path, iface, method, args=None, reply=None):
+        return self.bus.call_sync(BRIGHTNESS_SERVICE, path, iface, method, args,
+                                  GLib.VariantType(reply) if reply else None,
+                                  Gio.DBusCallFlags.NONE, 5000, None)
+
+    def _prop(self, path, iface, name):
+        return self._call(path, "org.freedesktop.DBus.Properties", "Get",
+                          GLib.Variant("(ss)", (iface, name)), "(v)").unpack()[0]
+
+    def displays(self):
+        """Yield (dbus_name, path, label, brightness_fraction, max)."""
+        try:
+            names = self._prop(BRIGHTNESS_PATH, BRIGHTNESS_IFACE, "DisplaysDBusNames")
+        except GLib.Error as e:
+            log.warning("brightness service unavailable: %s", e.message)
+            return
+        for name in names:
+            path = f"{BRIGHTNESS_PATH}/{name}"
+            try:
+                label = self._prop(path, DISPLAY_IFACE, "Label")
+                value = self._prop(path, DISPLAY_IFACE, "Brightness")
+                maximum = self._prop(path, DISPLAY_IFACE, "MaxBrightness")
+            except GLib.Error as e:
+                log.warning("cannot read %s: %s", name, e.message)
+                continue
+            if self.config["displays"] and label not in self.config["displays"]:
+                continue
+            if maximum > 0:
+                yield name, path, label, value / maximum, maximum
+
+    def curve(self, label):
+        return self.state["curves"].get(label) or default_curve()
+
+    def screen_locked(self):
+        try:
+            reply = self.bus.call_sync("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver",
+                                       "GetActive", None, GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, 2000, None)
+            return reply.unpack()[0]
+        except GLib.Error:
+            return False
+
+    def measure(self):
+        try:
+            ev = self.camera.measure()
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+            log.warning("measurement failed: %s", e)
+            ev = None
+        if ev is not None:
+            self.last_ev = (ev, GLib.get_monotonic_time())
+        return ev
+
+    def recent_ev(self, max_age=60):
+        if self.last_ev and GLib.get_monotonic_time() - self.last_ev[1] < max_age * 1_000_000:
+            return self.last_ev[0]
+        return self.measure()
+
+    def tick(self):
+        if self.screen_locked():
+            log.debug("screen locked, skipping")
+            return True
+        ev = self.measure()
+        if ev is None:
+            return True
+        for name, path, label, current, maximum in self.displays():
+            held = self.hold.get(label)
+            if held is not None:
+                if abs(ev - held) < self.config["deadzone_ev"]:
+                    log.debug("%s: holding manual setting (%.2f EV, set at %.2f)", label, ev, held)
+                    continue
+                del self.hold[label]
+            target = sample(self.curve(label), ev)
+            log.info("%s: ambient %.2f EV -> %.0f%% (now %.0f%%)", label, ev, target * 100, current * 100)
+            if abs(target - current) >= self.config["min_step"]:
+                try:
+                    self._call(path, DISPLAY_IFACE, "SetBrightnessWithContext",
+                               GLib.Variant("(ius)", (round(target * maximum), SUPPRESS_INDICATOR, CONTEXT)))
+                except GLib.Error as e:
+                    log.warning("setting brightness on %s failed: %s", label, e.message)
+        return True
+
+    def on_brightness_changed(self, _conn, _sender, _path, _iface, _signal, params):
+        _display, _value, _client, context = params.unpack()
+        if context == CONTEXT:
+            return
+        # key repeat produces a burst of changes; learn from where it settles
+        if self.learn_timer:
+            GLib.source_remove(self.learn_timer)
+        self.learn_timer = GLib.timeout_add_seconds(3, self.learn)
+
+    def learn(self):
+        self.learn_timer = None
+        ev = self.recent_ev()
+        if ev is None:
+            return False
+        for _name, _path, label, current, _max in self.displays():
+            self.state["curves"][label] = adjust(self.curve(label), ev, current)
+            self.hold[label] = ev
+            log.info("%s: learned %.0f%% at %.2f EV", label, current * 100, ev)
+        self._save_state()
+        return False
+
+    def on_wake(self, *_args):
+        # screen unlocked or system resumed: the light has probably changed
+        GLib.timeout_add_seconds(5, lambda: self.tick() and False)
+
+    def on_sleep(self, _conn, _sender, _path, _iface, _signal, params):
+        if not params.unpack()[0]:
+            self.on_wake()
+
+    def on_screensaver(self, _conn, _sender, _path, _iface, _signal, params):
+        if not params.unpack()[0]:
+            self.on_wake()
+
+    def run(self):
+        self.bus.signal_subscribe(None, BRIGHTNESS_IFACE, "BrightnessChanged", BRIGHTNESS_PATH, None,
+                                  Gio.DBusSignalFlags.NONE, self.on_brightness_changed)
+        self.bus.signal_subscribe(None, "org.freedesktop.ScreenSaver", "ActiveChanged", "/org/freedesktop/ScreenSaver", None,
+                                  Gio.DBusSignalFlags.NONE, self.on_screensaver)
+        system = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        system.signal_subscribe("org.freedesktop.login1", "org.freedesktop.login1.Manager", "PrepareForSleep",
+                                "/org/freedesktop/login1", None, Gio.DBusSignalFlags.NONE, self.on_sleep)
+        GLib.idle_add(lambda: self.tick() and False)
+        GLib.timeout_add_seconds(self.config["interval"], self.tick)
+        GLib.MainLoop().run()
+
+
+def load_config(path):
+    config = dict(DEFAULTS)
+    if path.exists():
+        with path.open("rb") as f:
+            config.update(tomllib.load(f))
+    return config
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("-c", "--config", type=Path, default=CONFIG_PATH, help=f"config file (default: {CONFIG_PATH})")
+    parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("run", help="run the daemon (default)")
+    sub.add_parser("measure", help="take one measurement and print the ambient level")
+    sub.add_parser("status", help="show displays, learned curves and the current prediction")
+    sub.add_parser("reset", help="forget learned curves")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
+    config = load_config(args.config)
+
+    if args.command == "measure":
+        ev = Camera(config["device"]).measure()
+        print("unavailable" if ev is None else f"{ev:.2f} EV")
+        return 0 if ev is not None else 1
+
+    daemon = Daemon(config)
+    if args.command == "reset":
+        daemon.state = {"curves": {}}
+        daemon._save_state()
+        print("learned curves cleared; restart the service to apply")
+    elif args.command == "status":
+        ev = daemon.measure()
+        print("ambient:", "unavailable" if ev is None else f"{ev:.2f} EV")
+        for name, _path, label, current, _max in daemon.displays():
+            curve = daemon.curve(label)
+            learned = "learned" if label in daemon.state["curves"] else "default"
+            predicted = "" if ev is None else f", predicted {sample(curve, ev) * 100:.0f}%"
+            print(f"{name} {label!r}: now {current * 100:.0f}%{predicted} ({learned} curve)")
+            print("  " + " ".join(f"{a:+d}:{v * 100:.0f}" for a, v in zip(ANCHORS, curve)))
+    else:
+        daemon.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

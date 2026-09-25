@@ -1,0 +1,13 @@
+[Unit]
+Description=Webcam-based automatic screen brightness for KDE Plasma
+Documentation=https://github.com/bubenkoff/plasma-webcam-brightness
+PartOf=graphical-session.target
+After=graphical-session.target plasma-powerdevil.service
+
+[Service]
+ExecStart=@BINDIR@/plasma-webcam-brightness run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target
