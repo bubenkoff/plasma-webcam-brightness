@@ -73,13 +73,18 @@ systemctl --user daemon-reload
 systemctl --user enable --now plasma-webcam-brightness
 ```
 
-On Arch Linux you can build a package from the bundled PKGBUILD. An AUR package
-will follow once AUR registration reopens.
+On Arch Linux, every [release](https://github.com/bubenkoff/plasma-webcam-brightness/releases)
+comes with a ready-built package. Download the `.pkg.tar.zst` and install it:
 
 ```sh
-cd packaging/aur && makepkg -si
+sudo pacman -U ./plasma-webcam-brightness-*-any.pkg.tar.zst
 systemctl --user enable --now plasma-webcam-brightness
 ```
+
+Download the file first. With pacman's default settings, installing straight
+from a URL requires a signed package, and this one isn't signed. You can also
+build it yourself with `cd packaging/aur && makepkg -si`. An AUR package will
+follow once AUR registration reopens.
 
 Run only one automatic-brightness tool at a time. Stop clight, wluma and the
 like before enabling this one.

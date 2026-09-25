@@ -6,7 +6,7 @@ pkgdesc="Automatic screen brightness for KDE Plasma using a webcam as the light 
 arch=('any')
 url="https://github.com/bubenkoff/plasma-webcam-brightness"
 license=('MIT')
-depends=('python' 'python-gobject' 'v4l-utils' 'ffmpeg' 'powerdevil')
+depends=('python' 'python-gobject' 'glib2' 'v4l-utils' 'ffmpeg' 'powerdevil')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('0da0d3e707ddf141ae6eb70d693b63cc2fee758562fb7df3b9763ccfc003d7c1')
 
