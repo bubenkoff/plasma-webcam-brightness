@@ -39,6 +39,7 @@ STATE_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")
 DEFAULTS = {
     "device": "/dev/video0",
     "interval": 300,  # seconds between measurements
+    "startup_delay": 60,  # first measurement after login waits for other apps to finish probing the camera
     "min_step": 0.04,  # smallest brightness change worth making (fraction)
     "deadzone_ev": 0.6,  # after a manual change, ignore ambient drift smaller than this
     "displays": [],  # display labels to control; empty means all
@@ -130,7 +131,8 @@ class Camera:
         names = ",".join(self.controls.values())
         out = self._ctl("-C", names).stdout
         values = dict(line.split(":", 1) for line in out.splitlines() if ":" in line)
-        return {k: v.strip() for k, v in values.items()}
+        # menu controls read back as "3 (Aperture Priority Mode)"; only the number can be set
+        return {k: v.split()[0] for k, v in values.items() if v.strip()}
 
     def _set(self, values):
         if values:
@@ -201,6 +203,7 @@ class Daemon:
         self.hold = {}  # label -> EV at which the user last set brightness
         self.last_ev = None
         self.learn_timer = None
+        self.stuck = None  # identity of the device node that stopped responding
 
     def _load_state(self):
         try:
@@ -255,10 +258,29 @@ class Daemon:
         except GLib.Error:
             return False
 
+    def _node(self):
+        try:
+            st = os.stat(self.camera.device)
+        except OSError:
+            return None
+        return st.st_ino, st.st_ctime_ns
+
     def measure(self):
+        if self.stuck is not None:
+            node = self._node()
+            if node is None or node == self.stuck:
+                # poking a hung camera keeps it hung; wait for it to be replugged
+                self.stuck = self.stuck if node else ()
+                return None
+            log.info("camera is back, resuming measurements")
+            self.stuck = None
         try:
             ev = self.camera.measure()
-        except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+        except subprocess.TimeoutExpired as e:
+            log.error("camera stopped responding (%s); not touching it again until it is replugged", e)
+            self.stuck = self._node() or ()
+            ev = None
+        except (RuntimeError, OSError) as e:
             log.warning("measurement failed: %s", e)
             ev = None
         if ev is not None:
@@ -335,7 +357,7 @@ class Daemon:
         system = Gio.bus_get_sync(Gio.BusType.SYSTEM)
         system.signal_subscribe("org.freedesktop.login1", "org.freedesktop.login1.Manager", "PrepareForSleep",
                                 "/org/freedesktop/login1", None, Gio.DBusSignalFlags.NONE, self.on_sleep)
-        GLib.idle_add(lambda: self.tick() and False)
+        GLib.timeout_add_seconds(self.config["startup_delay"], lambda: self.tick() and False)
         GLib.timeout_add_seconds(self.config["interval"], self.tick)
         GLib.MainLoop().run()
 

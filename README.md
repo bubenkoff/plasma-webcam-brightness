@@ -52,6 +52,10 @@ This tool only *reads* the webcam. It sets brightness through Plasma's own
 - It skips measuring while the screen is locked or another program is using the
   camera, e.g. during a video call. It measures again shortly after unlock and
   resume.
+- The first measurement waits `startup_delay` seconds after login, while
+  browsers and chat apps are still probing the camera.
+- If the camera stops responding, it is left alone until it is replugged, so a
+  hung camera isn't kept busy (with its light on) by repeated attempts.
 
 Learned curves live in `~/.local/state/plasma-webcam-brightness/state.json`.
 
@@ -108,6 +112,7 @@ Optional. Create `~/.config/plasma-webcam-brightness.toml`:
 ```toml
 device = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_XXXXXXXX-video-index0"  # default /dev/video0
 interval = 300        # seconds between measurements
+startup_delay = 60    # seconds to wait after login before the first measurement
 min_step = 0.04       # smallest change worth making (fraction of full brightness)
 deadzone_ev = 0.6     # after a manual change, ignore light changes smaller than this
 displays = []         # labels (see `status`) to control; empty = all
